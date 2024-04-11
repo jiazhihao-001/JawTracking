@@ -1,0 +1,284 @@
+# import 部分
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import pyk4a
+from pyk4a import Config, PyK4A, ColorResolution, DepthMode, CalibrationType
+import csv
+from matplotlib import pyplot as plt
+from mpl_toolkits import mplot3d  # noqa: F401
+
+filename = 'Resources/1024一百/第三回/data.csv'
+
+# 利用相机矩阵从二维到三维
+def convert_2d_to_3d(u, v, z, K):
+    v0 = K[1][2]
+    u0 = K[0][2]
+    fy = K[1][1]
+    fx = K[0][0]
+    x = int(-(u - u0) * z / fx)
+    y = int(-(v - v0) * z / fy)
+    return (x, y, int(z))
+
+# HSV范围 球状绿色
+green_light = np.array([20, 145, 60], np.uint8)
+green_dark = np.array([179, 255, 255], np.uint8)
+# 建立一些存储数据的数组
+fpssource = []
+distsource = []
+center_points = []
+
+MM_4_points = []
+MM_171_points = []
+MM_175_points = []
+MM_8_points = []
+MM_396_points = []
+# Face mesh detection
+mp_drawing = mp.solutions.drawing_utils
+mp_face_mesh = mp.solutions.face_mesh
+
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+
+with mp_face_mesh.FaceMesh(min_detection_confidence=0.5,min_tracking_confidence=0.5) as face_mesh:
+    k4a = PyK4A(
+        Config(
+            color_resolution=pyk4a.ColorResolution.RES_720P,
+            depth_mode=pyk4a.DepthMode.NFOV_UNBINNED,
+        )
+    )
+    k4a.start()
+    # 获取深度相机内参和畸变系数
+    intrinsics_depth = k4a.calibration.get_camera_matrix(CalibrationType.DEPTH)
+    distortion_depth = k4a.calibration.get_distortion_coefficients(CalibrationType.DEPTH)
+
+    # 获取彩色相机内参和畸变系数
+    intrinsics_color = k4a.calibration.get_camera_matrix(CalibrationType.COLOR)
+    distortion_color = k4a.calibration.get_distortion_coefficients(CalibrationType.COLOR)
+    cou = 0
+    while True:
+        prev_time = time.time()  # 记录上一帧开始的时间
+        capture = k4a.get_capture()
+        if capture.color is not None and capture.transformed_depth is not None:
+            # 获取深度图和彩色图像的高度和宽度
+            color_height, color_width, _ = capture.color.shape
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            image = capture.color
+            # Flip the image horizontally for a later selfie-view display
+            # Convert the BGR image to RGB.opencv中默认的加载图像的方式是BGR，但是在这些机器学习的架构当中使用的都是RGB，要进行一次转换
+            # image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # 为了提高性能，可选择将图像标记为不可写入,通过引用传递。
+            image.flags.writeable = False
+
+            # Process the image
+            results = face_mesh.process(image)
+
+            image.flags.writeable = True
+
+            # Convert the image color back so it can be displayed
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            # 选定范围
+            # a = {149, 176, 140, 32, 194, 148, 171, 208, 201}
+            # b = {378, 400, 369, 262, 418, 377, 396, 428, 421}
+            # c = {200, 199, 175, 152, 4}
+
+            a = {175}
+            b = {171}
+            c = {4, 8}
+            d = {396}
+            # c = list(range(100, 120))
+            selected_points = set().union(a, b, c, d)
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            xx, yy, hh, ww = 500, 240, 270, 270
+            im = capture.color[yy:yy + hh, xx:xx + ww]
+
+            # converting video streamed frames to HSV. which we will learn further
+            hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+
+            # Range Specification
+            green = cv2.inRange(hsv, green_light, green_dark)
+
+            green = cv2.GaussianBlur(green, (3, 3), 0)
+            # Morphological Transformation using dilation
+            kernel = np.ones((5, 5), "uint8")
+            kernel_e = np.ones((5, 5), "uint8")
+            green = cv2.erode(green, kernel_e)
+            green = cv2.dilate(green, kernel)
+
+            res_green = cv2.bitwise_and(im, im, mask=green)
+            # 将校准后的深度图像转换成可视化的深度信息
+            dep = cv2.applyColorMap(cv2.convertScaleAbs(capture.transformed_depth, alpha=0.03), cv2.COLORMAP_JET)
+
+            # Tracking Green
+            (contours, hierarchy) = cv2.findContours(green, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+            # 用于存储符合条件的目标的中心坐标和面积
+            valid_targets = []
+            for contour_index, contour in enumerate(contours):
+                area = cv2.contourArea(contour)
+                if area > 5:
+                    (x, y), radius = cv2.minEnclosingCircle(contour)
+                    x_relative = (int)(x)
+                    y_relative = (int)(y)
+                    depth_value = capture.transformed_depth[y_relative + yy, x_relative + xx]
+                    xyz_curr = convert_2d_to_3d(x_relative + xx, y_relative + yy, depth_value, intrinsics_color)
+
+                    # 记录中心坐标和面积
+                    valid_targets.append((x_relative, y_relative, xyz_curr[1], xyz_curr))
+                    # cv2.circle(capture.color, center=(x_relative + xx, y_relative + yy), color=(100, 200, 255), thickness=2,
+                    #            radius=1)
+                    # cv2.circle(dep, center=(x_relative + xx, y_relative + yy), color=(0, 255, 255), thickness=2, radius=1)
+
+            # 如果找到了符合条件的目标
+            if valid_targets:
+                # 按y坐标升序排序
+                valid_targets.sort(key=lambda x: x[2])
+                # 选择y值最小的目标
+                target_x, target_y, _, target_xyz = valid_targets[0]
+                # 在彩色图像上绘制选择的目标
+                cv2.circle(capture.color, center=(target_x + xx, target_y + yy), color=(100, 200, 255), thickness=2,
+                           radius=1)
+                # 限定追踪的帧数的
+                # cou = cou + 1
+                # if cou > 100 :
+                #     break
+                center_points.append(target_xyz)
+            else:
+                center_points.append((0, 0, 0))  # 数据缺失的位置都标记为000
+            print(len(center_points))
+            if len(center_points) > 0 :
+                cv2.putText(capture.color, "Depth in mm: " + str(center_points[-1][2]), (250, 400), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                            (0, 255, 0), 3)
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    for idx in selected_points:
+                        if idx == 4:
+                            point = face_landmarks.landmark[idx]
+                            M_4_x = int(point.x * image.shape[1])
+                            M_4_y = int(point.y * image.shape[0])
+                            M_depth_value = capture.transformed_depth[M_4_y, M_4_x]
+                            M_curr = convert_2d_to_3d(M_4_x, M_4_y, M_depth_value, intrinsics_color)
+                            MM_4_points.append(M_curr)
+                            # print(M_curr)
+                            cv2.circle(capture.color, (M_4_x, M_4_y), 2, (0, 255, 0), -1)
+                        if idx == 171:
+                            point = face_landmarks.landmark[idx]
+                            M_171_x = int(point.x * image.shape[1])
+                            M_171_y = int(point.y * image.shape[0])
+                            M_depth_value = capture.transformed_depth[M_171_y, M_171_x]
+                            M_curr = convert_2d_to_3d(M_171_x, M_171_y, M_depth_value, intrinsics_color)
+                            MM_171_points.append(M_curr)
+                            # print(M_curr)
+                            cv2.circle(capture.color, (M_171_x, M_171_y), 2, (0, 255, 0), -1)
+                        if idx == 175:
+                            point = face_landmarks.landmark[idx]
+                            M_175_x = int(point.x * image.shape[1])
+                            M_175_y = int(point.y * image.shape[0])
+                            M_depth_value = capture.transformed_depth[M_175_y, M_175_x]
+                            M_curr = convert_2d_to_3d(M_175_x, M_175_y, M_depth_value, intrinsics_color)
+                            MM_175_points.append(M_curr)
+                            # print(M_curr)
+                            cv2.circle(capture.color, (M_175_x, M_175_y), 2, (0, 255, 0), -1)
+                        if idx == 396:
+                            point = face_landmarks.landmark[idx]
+                            M_396_x = int(point.x * image.shape[1])
+                            M_396_y = int(point.y * image.shape[0])
+                            M_depth_value = capture.transformed_depth[M_396_y, M_396_x]
+                            M_curr = convert_2d_to_3d(M_396_x, M_396_y, M_depth_value, intrinsics_color)
+                            MM_396_points.append(M_curr)
+                            cv2.circle(capture.color, (M_396_x, M_396_y), 2, (0, 255, 0), -1)
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            TotalTime = time.time() - prev_time
+            prev_time = time.time()
+            if TotalTime > 0:
+                fps = 1 / TotalTime
+            else:
+                fps = float('inf')
+            if (fps < 250):
+                cv2.putText(capture.color, f'FPS: {int(fps)}', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.5,
+                            (0, 255, 0), 2)
+            else:
+                cv2.putText(capture.color, f'FPS: 250', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 2)
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+            # 在图像上画一个正方形
+            side_length = min(color_width, color_height) // 8
+            # 计算正方形的左上角和右下角坐标
+            top_left_x = (color_width - side_length) // 2
+            top_left_y = (color_height - side_length) // 2
+            bottom_right_x = top_left_x + side_length
+            bottom_right_y = top_left_y + side_length
+            # 设置正方形的颜色（BGR格式）和线宽
+            color = (0, 0, 255)  # 红色 (BGR格式)
+            thickness = 2  # 线宽
+            # 在图像上画一个正方形
+            cv2.rectangle(capture.color, (top_left_x, top_left_y), (bottom_right_x, bottom_right_y), color, thickness)
+
+            # 显示彩色图像和深度图像
+            cv2.imshow("Color", capture.color)
+            # cv2.imshow("Transformed Depth", dep)
+            # cv2.imshow("res_green Tracker", res_green)
+
+
+        if cv2.waitKey(1) == ord(' ') & 0xFF != ord('q'):
+            if len(center_points) > 0 and len(MM_4_points) > 0 and len(MM_175_points) > 0 and len(MM_396_points)> 0 and len(MM_171_points) > 0:
+                print(len(center_points),len(MM_4_points),len(MM_175_points),len(MM_396_points), len(MM_171_points))
+                result_data = []  # 存储最终结果的列表
+                # 添加列标注
+                header_row = ['center_point x', 'center_point y', 'center_point z', '4_point x', '4_point y',
+                              '4_point z',
+                              '175_point x', '175_point y', '175_point z', '396_point x',
+                              '396_point y', '396_point z', '171_point x', '171_point y', '171_point z']
+                result_data.append(header_row)
+                # 获取最大的数据长度
+                max_length = max(len(center_points), len(MM_4_points), len(MM_175_points), len(MM_396_points),
+                                 len(MM_171_points))
+                for i in range(max_length):
+                    row_data = []
+
+                    # 处理center_points数据
+                    if i < len(center_points):
+                        center_point = center_points[i]
+                        row_data.extend(center_point)
+                    else:
+                        row_data.extend([None, None, None])
+
+                    # 处理MM_4_points数据
+                    if i < len(MM_4_points):
+                        MM_4_point = MM_4_points[i]
+                        row_data.extend(MM_4_point)
+                    else:
+                        row_data.extend([None, None, None])
+
+                    # 处理MM_175_points数据
+                    if i < len(MM_175_points):
+                        MM_175_point = MM_175_points[i]
+                        row_data.extend(MM_175_point)
+                    else:
+                        row_data.extend([None, None, None])
+
+                    # 处理MM_396_points数据
+                    if i < len(MM_396_points):
+                        MM_396_point = MM_396_points[i]
+                        row_data.extend(MM_396_point)
+                    else:
+                        row_data.extend([None, None, None])
+
+                    # 处理MM_171_points数据
+                    if i < len(MM_171_points):
+                        MM_171_point = MM_171_points[i]
+                        row_data.extend(MM_171_point)
+                    else:
+                        row_data.extend([None, None, None])
+
+                    result_data.append(row_data)
+
+                with open(filename, 'w', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerows(result_data)
+            break
+    k4a.stop()
+
+
+
