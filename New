@@ -1,0 +1,194 @@
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import mediapipe as mp
+import csv
+
+# Face mesh detection
+mp_drawing = mp.solutions.drawing_utils
+mp_face_mesh = mp.solutions.face_mesh
+drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+
+# これがD405のパイプラインです
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 90)
+config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 90)
+
+# Start streaming
+profile = pipeline.start(config)
+depth_sensor = profile.get_device().first_depth_sensor()
+depth_scale = depth_sensor.get_depth_scale()
+
+# Get stream profile and camera intrinsics
+profile = pipeline.get_active_profile()
+depth_profile = rs.video_stream_profile(profile.get_stream(rs.stream.depth))
+depth_intrinsics = depth_profile.get_intrinsics()
+
+camera_parameter = [depth_intrinsics.ppx,depth_intrinsics.ppy,
+                    depth_intrinsics.fx,depth_intrinsics.fy]
+def convert_2d_to_3d(u, v, z, camera_parameter):
+    fy = camera_parameter[3]
+    fx = camera_parameter[2]
+    v0 = camera_parameter[1]
+    u0 = camera_parameter[0]
+    x = round((-(u - u0) * z / fx), 1)
+    y = round(((v - v0) * z / fy), 1)
+    return [x, y, z]
+
+# HSVレンジ
+green_light = np.array([30, 72, 175], np.uint8)
+green_dark = np.array([68, 255, 255], np.uint8)
+
+
+# 3種類のデータを別々に保存
+marks_data = [] # 1.
+face_data = []  # 2.
+land_data = []  # 3.
+# 3種類のデータをそれぞれ格納するパス
+filename = 'Resources/markers_data/markers_data.csv'
+filename_face = 'Resources/markers_data/face_data.csv'
+filename_land = 'Resources/markers_data/land_data.csv'
+
+# We will be removing the background of objects more than clipping_distance_in_meters meters away
+clipping_distance_in_meters = 0.6 # 0.6 meter
+clipping_distance = clipping_distance_in_meters / depth_scale
+depth_width, depth_height = depth_intrinsics.width, depth_intrinsics.height
+
+with mp_face_mesh.FaceMesh(min_detection_confidence=0.5,min_tracking_confidence=0.5) as face_mesh:
+    while True:
+        # Wait for a coherent pair of frames: depth and color
+        frames = pipeline.wait_for_frames()
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
+
+        # Convert images to numpy arrays
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+
+        # # Remove background - Set pixels further than clipping_distance to grey
+        grey_color = 153
+        depth_image_3d = np.dstack((depth_image,depth_image,depth_image)) #depth image is 1 channel, color is 3 channels
+        bg_removed = np.where((depth_image_3d > clipping_distance) | (depth_image_3d <= 0.07), grey_color, color_image)
+        color_image = bg_removed
+        # Flip the image horizontally for a later selfie-view display
+        # Convert the BGR image to RGB.opencv
+        color_image = cv2.cvtColor(cv2.flip(color_image, 1), cv2.COLOR_BGR2RGB)
+        # To improve performance, optionally mark the image as not writeable to
+        # pass by reference.
+        color_image.flags.writeable = False
+        # Process the image
+        results = face_mesh.process(color_image)
+        color_image.flags.writeable = True
+        # Convert the image color back so it can be displayed
+        color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        xx, yy, hh, ww = 250, 120, 260, 350
+        im = color_image[yy:yy + hh, xx:xx + ww]
+
+        # converting video streamed frames to HSV. which we will learn further
+        hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, green_light, green_dark)
+        green = cv2.GaussianBlur(green, (3, 3), 0)
+
+        # Morphological Transformation using dilation
+        kernel = np.ones((5, 5), "uint8")
+        kernel_e = np.ones((5, 5), "uint8")
+        green = cv2.erode(green, kernel_e)
+        green = cv2.dilate(green, kernel)
+        res_green = cv2.bitwise_and(im, im, mask=green)
+
+        # 深度画像を可視化された深度情報に変換します
+        dep = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
+
+        # Tracking Green
+        (contours, hierarchy) = cv2.findContours(green, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        print(len(contours))
+
+        targets = []
+        for contour_index, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            if area > 40:
+                (x, y), radius = cv2.minEnclosingCircle(contour)
+                x_relative = (int)(x)
+                y_relative = (int)(y)
+                depth_value = round(depth_frame.as_depth_frame().get_distance(depth_width - x_relative - xx, y_relative + yy) * 1000, 2)
+                # print(depth_value)
+                xyz_curr = convert_2d_to_3d(x_relative + xx, y_relative + yy, depth_value, camera_parameter)
+                print(xyz_curr)
+                targets.append((xyz_curr))
+                cv2.rectangle(color_image, (xx, yy), (xx + ww, yy + hh), color=(100, 200, 255), thickness=2)
+                cv2.circle(color_image, center=(x_relative + xx, y_relative + yy), color=(100, 200, 255), thickness=2,
+                           radius=3)
+                cv2.circle(dep, center=(depth_width - x_relative - xx, y_relative + yy), color=(0, 255, 255), thickness=2, radius=3)
+
+        if targets:
+            # X座標で昇順に並べ替えます
+            targets.sort(key=lambda x: x[0])
+
+        marks_data.append(targets)  # 1.
+
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+        # 選択範囲
+        a = {149, 176, 140, 32, 194, 148, 171, 208, 201}
+        b = {378, 400, 369, 262, 418, 377, 396, 428, 421}
+        c = {200, 199, 175, 152}
+        selected_points = set().union(a, b, c)
+
+        # 基準点
+        d = {4, 8}
+        selected_land = set().union(d)
+        targets_face = []
+        targets_land = []
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                for idx in selected_points:
+                    point = face_landmarks.landmark[idx]
+                    x = int(point.x * color_image.shape[1])
+                    y = int(point.y * color_image.shape[0])
+                    depth_value = round(depth_frame.as_depth_frame().get_distance(depth_width - x, y) * 1000, 2)
+                    xyz_curr = convert_2d_to_3d(x, y, depth_value, camera_parameter)
+                    targets_face.append((xyz_curr))
+                    cv2.circle(color_image, (x, y), 2, (0, 255, 0), -1)
+                    cv2.putText(color_image, str(idx), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (8, 46, 84), 1, cv2.LINE_AA)
+                    cv2.circle(dep, center=(depth_width-x, y), color=(0, 255, 255), thickness=2, radius=3)
+                for idx in selected_land:
+                    point = face_landmarks.landmark[idx]
+                    x = int(point.x * color_image.shape[1])
+                    y = int(point.y * color_image.shape[0])
+                    depth_value = round(depth_frame.as_depth_frame().get_distance(depth_width - x, y) * 1000, 2)
+                    xyz_curr = convert_2d_to_3d(x, y, depth_value, camera_parameter)
+                    targets_land.append((xyz_curr))
+                    cv2.circle(color_image, (x, y), 2, (0, 255, 0), -1)
+                    cv2.putText(color_image, str(idx), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (8, 46, 84), 1, cv2.LINE_AA)
+                    cv2.circle(dep, center=(depth_width-x, y), color=(0, 255, 255), thickness=2, radius=3)
+
+        face_data.append(targets_face)  # 2.
+        land_data.append(targets_land)  # 3.
+
+        # ——————————————————————————————————————————————————
+        # Show images
+        dep = cv2.flip(dep, 1)
+        cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
+        cv2.imshow('RealSense', color_image)
+        cv2.imshow("Transformed Depth", dep)
+        key = cv2.waitKey(1)
+        # Press esc or 'q' to close the image window
+        if key & 0xFF == ord(' ') or key == 27:
+            cv2.destroyAllWindows()
+            with open(filename, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerows(marks_data)
+            with open(filename_face, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerows(face_data)
+            with open(filename_land, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerows(land_data)
+            break
+    # Stop streaming
+    pipeline.stop()
